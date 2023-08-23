@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/go-kit/log"
@@ -33,6 +34,9 @@ import (
 	"github.com/prometheus/alertmanager/types"
 )
 
+// https://docs.opsgenie.com/docs/alert-api - 130 characters meaning runes.
+const maxMessageLenRunes = 130
+
 // Notifier implements a Notifier for OpsGenie notifications.
 type Notifier struct {
 	conf    *config.OpsGenieConfig
@@ -44,7 +48,7 @@ type Notifier struct {
 
 // New returns a new OpsGenie notifier.
 func New(c *config.OpsGenieConfig, t *template.Template, l log.Logger, httpOpts ...commoncfg.HTTPClientOption) (*Notifier, error) {
-	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "opsgenie", append(httpOpts, commoncfg.WithHTTP2Disabled())...)
+	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "opsgenie", httpOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +71,8 @@ type opsGenieCreateMessage struct {
 	Tags        []string                         `json:"tags,omitempty"`
 	Note        string                           `json:"note,omitempty"`
 	Priority    string                           `json:"priority,omitempty"`
+	Entity      string                           `json:"entity,omitempty"`
+	Actions     []string                         `json:"actions,omitempty"`
 }
 
 type opsGenieCreateMessageResponder struct {
@@ -96,6 +102,7 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	}
 
 	for _, req := range requests {
+		req.Header.Set("User-Agent", notify.UserAgentHeader)
 		resp, err := n.client.Do(req)
 		if err != nil {
 			return true, err
@@ -103,14 +110,14 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		shouldRetry, err := n.retrier.Check(resp.StatusCode, resp.Body)
 		notify.Drain(resp)
 		if err != nil {
-			return shouldRetry, err
+			return shouldRetry, notify.NewErrorWithReason(notify.GetFailureReasonFromStatusCode(resp.StatusCode), err)
 		}
 	}
 	return true, nil
 }
 
 // Like Split but filter out empty strings.
-func safeSplit(s string, sep string) []string {
+func safeSplit(s, sep string) []string {
 	a := strings.Split(strings.TrimSpace(s), sep)
 	b := a[:0]
 	for _, x := range a {
@@ -156,7 +163,7 @@ func (n *Notifier) createRequests(ctx context.Context, as ...*types.Alert) ([]*h
 		q := resolvedEndpointURL.Query()
 		q.Set("identifierType", "alias")
 		resolvedEndpointURL.RawQuery = q.Encode()
-		var msg = &opsGenieCloseMessage{Source: tmpl(n.conf.Source)}
+		msg := &opsGenieCloseMessage{Source: tmpl(n.conf.Source)}
 		var buf bytes.Buffer
 		if err := json.NewEncoder(&buf).Encode(msg); err != nil {
 			return nil, false, err
@@ -167,9 +174,9 @@ func (n *Notifier) createRequests(ctx context.Context, as ...*types.Alert) ([]*h
 		}
 		requests = append(requests, req.WithContext(ctx))
 	default:
-		message, truncated := notify.Truncate(tmpl(n.conf.Message), 130)
+		message, truncated := notify.TruncateInRunes(tmpl(n.conf.Message), maxMessageLenRunes)
 		if truncated {
-			level.Debug(n.logger).Log("msg", "truncated message", "truncated_message", message, "alert", key)
+			level.Warn(n.logger).Log("msg", "Truncated message", "alert", key, "max_runes", maxMessageLenRunes)
 		}
 
 		createEndpointURL := n.conf.APIURL.Copy()
@@ -190,19 +197,33 @@ func (n *Notifier) createRequests(ctx context.Context, as ...*types.Alert) ([]*h
 				continue
 			}
 
+			if responder.Type == "teams" {
+				teams := safeSplit(responder.Name, ",")
+				for _, team := range teams {
+					newResponder := opsGenieCreateMessageResponder{
+						Name: tmpl(team),
+						Type: tmpl("team"),
+					}
+					responders = append(responders, newResponder)
+				}
+				continue
+			}
+
 			responders = append(responders, responder)
 		}
 
-		var msg = &opsGenieCreateMessage{
+		msg := &opsGenieCreateMessage{
 			Alias:       alias,
 			Message:     message,
 			Description: tmpl(n.conf.Description),
 			Details:     details,
 			Source:      tmpl(n.conf.Source),
 			Responders:  responders,
-			Tags:        safeSplit(string(tmpl(n.conf.Tags)), ","),
+			Tags:        safeSplit(tmpl(n.conf.Tags), ","),
 			Note:        tmpl(n.conf.Note),
 			Priority:    tmpl(n.conf.Priority),
+			Entity:      tmpl(n.conf.Entity),
+			Actions:     safeSplit(tmpl(n.conf.Actions), ","),
 		}
 		var buf bytes.Buffer
 		if err := json.NewEncoder(&buf).Encode(msg); err != nil {
@@ -215,11 +236,11 @@ func (n *Notifier) createRequests(ctx context.Context, as ...*types.Alert) ([]*h
 		requests = append(requests, req.WithContext(ctx))
 
 		if n.conf.UpdateAlerts {
-			updateMessageEndpointUrl := n.conf.APIURL.Copy()
-			updateMessageEndpointUrl.Path += fmt.Sprintf("v2/alerts/%s/message", alias)
-			q := updateMessageEndpointUrl.Query()
+			updateMessageEndpointURL := n.conf.APIURL.Copy()
+			updateMessageEndpointURL.Path += fmt.Sprintf("v2/alerts/%s/message", alias)
+			q := updateMessageEndpointURL.Query()
 			q.Set("identifierType", "alias")
-			updateMessageEndpointUrl.RawQuery = q.Encode()
+			updateMessageEndpointURL.RawQuery = q.Encode()
 			updateMsgMsg := &opsGenieUpdateMessageMessage{
 				Message: msg.Message,
 			}
@@ -227,7 +248,7 @@ func (n *Notifier) createRequests(ctx context.Context, as ...*types.Alert) ([]*h
 			if err := json.NewEncoder(&updateMessageBuf).Encode(updateMsgMsg); err != nil {
 				return nil, false, err
 			}
-			req, err := http.NewRequest("PUT", updateMessageEndpointUrl.String(), &updateMessageBuf)
+			req, err := http.NewRequest("PUT", updateMessageEndpointURL.String(), &updateMessageBuf)
 			if err != nil {
 				return nil, true, err
 			}
@@ -254,7 +275,16 @@ func (n *Notifier) createRequests(ctx context.Context, as ...*types.Alert) ([]*h
 		}
 	}
 
-	apiKey := tmpl(string(n.conf.APIKey))
+	var apiKey string
+	if n.conf.APIKey != "" {
+		apiKey = tmpl(string(n.conf.APIKey))
+	} else {
+		content, err := os.ReadFile(n.conf.APIKeyFile)
+		if err != nil {
+			return nil, false, errors.Wrap(err, "read key_file error")
+		}
+		apiKey = tmpl(string(content))
+	}
 
 	if err != nil {
 		return nil, false, errors.Wrap(err, "templating error")
